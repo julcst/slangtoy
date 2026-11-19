@@ -3,13 +3,9 @@ name = "slangtoy"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "Julian Stamm", email = "mail@julcs.com" }
-]
+authors = [{ name = "Julian Stamm", email = "mail@julcs.com" }]
 requires-python = ">=3.13"
-dependencies = [
-    "slangpy>=0.43.1",
-]
+dependencies = ["numpy>=2.5.5", "slangpy>=0.43.1"]
 
 [project.scripts]
 slangtoy = "slangtoy:main"
