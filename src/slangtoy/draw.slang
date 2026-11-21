@@ -57,52 +57,74 @@ float sumBlock(int3 id, Field field, bool square)
     return sum;
 }
 
-float energyScale(Field field, Field energy, int channel)
+float energyScale(Field energy, float initialEnergy)
 {
-    float meanSquare = energy[0, 0, channel] / (float(field.shape[0]) * field.shape[1]);
-    return rsqrt(max(meanSquare, 1e-12));
+    float total = 0.0;
+    for (int c = 0; c < energy.shape[2]; ++c)
+        total += energy[0, 0, c];
+    return total > 0.0 ? sqrt(initialEnergy / total) : 1.0;
 }
 
-float normalize(int3 id, Field field, Field energy)
+float normalize(int3 id, Field field, Field energy, float initialEnergy)
 {
-    return field[id.z, id.y, id.x] * energyScale(field, energy, id.x);
+    return field[id.z, id.y, id.x] * energyScale(energy, initialEnergy);
 }
 
-float logit(Field field, Field energy, bool normalized, int3 pos)
+float cellPeak(Field field, int2 pos)
 {
-    float value = field[pos.x, pos.y, pos.z];
-    return normalized ? value * energyScale(field, energy, pos.z) : value;
+    float peak = field[pos.x, pos.y, 0];
+    for (int c = 1; c < field.shape[2]; ++c)
+        peak = max(peak, field[pos.x, pos.y, c]);
+    return peak;
 }
 
-float collapse(int3 id, Field field, Field energy, bool normalized, uint seed, float rate)
+float probabilityWeight(float value, bool root, float peak)
+{
+    return root ? value * value : exp(value - peak);
+}
+
+float collapse(int3 id, Field field, Field energy, float initialEnergy,
+               bool normalized, bool root, uint seed, float rate)
 {
     int3 pos = id.zyx;
     uint2 frameKey = pcg2d(uint2(seed, 0u));
     float2 random = random2(uint2(pos.xy) + frameKey);
-    if (random.x >= rate * lerp(0.1, 1.0, float(frameKey.x >> 8u) / 16777216.0))
-        return logit(field, energy, normalized, pos);
+    float scale = normalized ? energyScale(energy, initialEnergy) : 1.0;
+    float value = field[pos.x, pos.y, pos.z] * scale;
+    if (random.x >= rate)
+        return value;
 
     int channels = int(field.shape[2]);
-    float peak = logit(field, energy, normalized, pos);
-    for (int c = 0; c < channels; ++c)
-        peak = max(peak, logit(field, energy, normalized, int3(pos.xy, c)));
-
+    float peak = root ? 0.0 : cellPeak(field, pos.xy) * scale;
     float total = 0.0, lower = 0.0, upper = 0.0;
     for (int c = 0; c < channels; ++c)
     {
         if (c == pos.z)
             lower = total;
-        total += exp(logit(field, energy, normalized, int3(pos.xy, c)) - peak);
+        total += probabilityWeight(field[pos.x, pos.y, c] * scale, root, peak);
         if (c == pos.z)
             upper = total;
     }
+    if (total == 0.0)
+    {
+        total = float(channels);
+        lower = float(pos.z);
+        upper = lower + 1.0;
+    }
     float sample = random.y * total;
-    bool winner = sample >= lower && (sample < upper || pos.z == channels - 1);
-    float gap = log(99.0 * max(channels - 1, 1));
-    return (float(winner) - 1.0 / channels) * gap;
+    // The final nonempty interval also handles a sample rounded up to total.
+    bool winner = upper > lower && sample >= lower && (sample < upper || upper == total);
+    if (!root)
+    {
+        float gap = log(99.0 * max(channels - 1, 1));
+        return (float(winner) - 1.0 / channels) * gap;
+    }
+    float probability = winner ? (channels == 1 ? 1.0 : 0.99) : 0.01 / max(channels - 1, 1);
+    float magnitude = sqrt(channels * probability);
+    return value < 0.0 ? -magnitude : magnitude;
 }
 
-float4 render(int2 pos, int2 resolution, Field field, ITensor<float, 2> palette)
+float4 render(int2 pos, int2 resolution, Field field, ITensor<float, 2> palette, bool root)
 {
     float2 size = float2(field.shape[1], field.shape[0]);
     float2 fit = float2(resolution) / size;
@@ -112,17 +134,20 @@ float4 render(int2 pos, int2 resolution, Field field, ITensor<float, 2> palette)
         return float4(0.008, 0.009, 0.013, 1.0);
 
     int2 p = int2(uv * size).yx;
-    float peak = field[p.x, p.y, 0];
-    for (int c = 1; c < field.shape[2]; ++c)
-        peak = max(peak, field[p.x, p.y, c]);
-
+    float peak = root ? 0.0 : cellPeak(field, p);
     float total = 0.0;
     float3 color = 0.0;
     for (int c = 0; c < field.shape[2]; ++c)
     {
-        float weight = exp(field[p.x, p.y, c] - peak);
+        float weight = probabilityWeight(field[p.x, p.y, c], root, peak);
         color += weight * float3(palette[c, 0], palette[c, 1], palette[c, 2]);
         total += weight;
+    }
+    if (total == 0.0)
+    {
+        for (int c = 0; c < field.shape[2]; ++c)
+            color += float3(palette[c, 0], palette[c, 1], palette[c, 2]);
+        total = float(field.shape[2]);
     }
     return float4(color / total, 1.0);
 }

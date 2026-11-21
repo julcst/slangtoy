@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from colorsys import hsv_to_rgb
+from math import expm1, log1p
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +22,7 @@ PALETTE = np.array([
 
 class Demo(SlangToy):
     def __init__(self) -> None:
-        super().__init__(Path(__file__).with_name("draw.slang"), title="Logit World")
+        super().__init__(Path(__file__).with_name("draw.slang"), title="Square World")
         self.rng = np.random.default_rng()
         self.pending: list[Callable[[], None]] = []
         self.fields = tuple(self.buffer(RES, RES, len(PALETTE)) for _ in range(3))
@@ -44,15 +45,16 @@ class Demo(SlangToy):
     def setup(self) -> None:
         panel = spy.ui.Window(
             self.ui.screen, "Simulation",
-            position=spy.float2(10, 80), size=spy.float2(300, 200),
+            position=spy.float2(10, 80), size=spy.float2(320, 230),
         )
+        self.probability_mode = spy.ui.ComboBox(panel, "Probability", value=1, items=["Logit", "Root"])
         self.normalization = spy.ui.CheckBox(panel, "Normalize energy", value=True)
         self.collapse_rate = spy.ui.SliderFloat(
-            panel, "Collapse rate", value=0.04, min=0, max=5, format="%.3f%%",
+            panel, "Collapse chance / s", value=1.31, min=0, max=95, format="%.3f%%",
             flags=spy.ui.SliderFlags.logarithmic | spy.ui.SliderFlags.always_clamp,
         )
         self.advance_rate = spy.ui.SliderFloat(
-            panel, "Advance rate", value=0.2, min=0, max=1, format="%.3f",
+            panel, "Advance rate / s", value=12, min=0, max=60, format="%.3f",
             flags=spy.ui.SliderFlags.always_clamp,
         )
         self.steps_per_frame = spy.ui.SliderInt(
@@ -65,7 +67,9 @@ class Demo(SlangToy):
 
     def reset_field(self) -> None:
         field = self.fields[0]
-        field.copy_from_numpy(self.rng.standard_normal(tuple(field.shape), dtype=np.float32))
+        initial = self.rng.standard_normal(tuple(field.shape), dtype=np.float32)
+        field.copy_from_numpy(initial)
+        self.initial_energy = float(np.square(initial, dtype=np.float64).sum())
         self.seed = int(self.rng.integers(2**31))
 
     def reseed_kernel(self) -> None:
@@ -101,13 +105,15 @@ class Demo(SlangToy):
         current, next_field, scratch = self.fields
         encoder = frame.encoder
         seed = self.seed
-        if not self.paused:
+        root = self.probability_mode.value == 1
+        if not self.paused and frame.dt > 0:
             steps = self.steps_per_frame.value
             cell = spy.call_id(3)
             normalize = self.normalization.value
-            advance_rate = self.advance_rate.value / steps
-            # Split the collapse probability by compounding the probability of no collapse.
-            collapse_rate = 1 - (1 - self.collapse_rate.value / 100) ** (1 / steps)
+            step_dt = frame.dt / steps
+            advance_rate = self.advance_rate.value * step_dt
+            # Compound the probability of no collapse over the elapsed time.
+            collapse_rate = -expm1(log1p(-self.collapse_rate.value / 100) * step_dt)
             for _ in range(steps):
                 self.module.advance(
                     cell, current, self.kernel, advance_rate,
@@ -116,13 +122,13 @@ class Demo(SlangToy):
                 if collapse_rate > 0:
                     energy = self.energy(next_field, encoder) if normalize else self.sums[-1]
                     self.module.collapse(
-                        cell, next_field, energy, normalize, seed, collapse_rate,
+                        cell, next_field, energy, self.initial_energy, normalize, root, seed, collapse_rate,
                         _result=scratch, _append_to=encoder,
                     )
                     next_field, scratch = scratch, next_field
                 if normalize:
                     self.module.normalize(
-                        cell, next_field, self.energy(next_field, encoder),
+                        cell, next_field, self.energy(next_field, encoder), self.initial_energy,
                         _result=scratch, _append_to=encoder,
                     )
                     next_field, scratch = scratch, next_field
@@ -130,7 +136,7 @@ class Demo(SlangToy):
                 seed = (seed + 1) % 2**31
 
         self.module.render(
-            spy.call_id(2), frame.resolution, current, self.palette,
+            spy.call_id(2), frame.resolution, current, self.palette, root,
             _result=frame.target, _append_to=encoder,
         )
         self.fields = (current, next_field, scratch)
