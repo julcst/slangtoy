@@ -4,13 +4,20 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import subprocess
+import sys
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from math import floor
 from pathlib import Path
 from time import perf_counter, sleep
 
 import slangpy as spy
+from imgui_bundle import imgui
+from slangpy.ui import imgui_bundle as imgui_backend
 
 _TIMING_SLOTS = 4
 _LOG = logging.getLogger(__name__)
@@ -20,8 +27,8 @@ _LOG = logging.getLogger(__name__)
 class Frame:
     """Render inputs for one frame. Time and dt are in seconds.
 
-    Time follows pause state. Index and dt track rendered frames while paused.
-    Record commands during render and let the window handle submission.
+    Time and index advance only when rendering. Record commands during render
+    and let the window handle submission.
     """
 
     target: spy.Texture
@@ -36,10 +43,12 @@ class Frame:
 
 
 class SlangToy:
-    """Override setup() to build widgets on ui.screen and render() to draw.
+    """Override render() to draw and draw_ui() for immediate-mode ImGui controls.
 
     Pass a shader path to expose a hot-reloadable SlangPy module as self.module.
     Use the frame's encoder for all drawing to include it in GPU timings.
+    Read self.mouse_pos for the last pointer position as (x, y) render pixels
+    from the top left, or None before the first mouse event.
     """
 
     def __init__(
@@ -61,8 +70,8 @@ class SlangToy:
             enable_hot_reload=False,
         )
         self.surface = self.device.create_surface(self.window)
-        self.ui = spy.ui.Context(self.device)
         self.paused = False
+        self.mouse_pos: tuple[int, int] | None = None
         self.show_stats = show_stats
         self.fps = 0.0
         self.gpu_ms: float | None = None
@@ -89,12 +98,17 @@ class SlangToy:
         self._timings: deque[tuple[int, int]] = deque()
         self._next_timestamp = 0
         self._screenshots: list[Path] = []
+        self._inspect_requested = False
+        self._ui_scale = 1.0
         self._pending_size: tuple[int, int] | None = None
         self._status = ""
         self._status_until = 0.0
 
     def setup(self) -> None:
-        """Create custom resources and UI widgets once, before the first frame."""
+        """Create custom resources once, before the first frame."""
+
+    def draw_ui(self) -> None:
+        """Build controls with imgui_bundle.imgui on each display refresh."""
 
     def render(self, frame: Frame) -> None:
         """Record work for the linear RGBA16F target.
@@ -111,7 +125,7 @@ class SlangToy:
         """Handle a mouse event that the UI left unhandled."""
 
     def screenshot(self, path: str | Path | None = None) -> Path:
-        """Queue a PNG of the next rendered frame before the UI is drawn."""
+        """Queue a PNG of the next displayed shader frame, without the UI."""
         if path is None:
             path = Path(f"screenshot-{datetime.now():%Y%m%d-%H%M%S-%f}.png")
         path = Path(path)
@@ -119,7 +133,7 @@ class SlangToy:
         return path
 
     def _keyboard_event(self, event: spy.KeyboardEvent) -> None:
-        if self.ui.handle_keyboard_event(event):
+        if imgui_backend.handle_keyboard_event(event):
             return
         if event.type == spy.KeyboardEventType.key_press:
             match event.key:
@@ -127,19 +141,28 @@ class SlangToy:
                     self.window.close()
                 case spy.KeyCode.space:
                     self.paused = not self.paused
-                case spy.KeyCode.f2:
+                case spy.KeyCode.s:
                     self.screenshot()
-                case spy.KeyCode.f3:
+                case spy.KeyCode.o:
                     self.show_stats = not self.show_stats
-                case spy.KeyCode.f5 if self._watch:
+                case spy.KeyCode.l if self._watch:
                     self._reload_requested = True
+                case spy.KeyCode.i:
+                    self.paused = True
+                    self._inspect_requested = True
+                case spy.KeyCode.minus:
+                    self._ui_scale = max(0.75, self._ui_scale - 0.125)
+                case spy.KeyCode.equal:
+                    self._ui_scale = min(2.5, self._ui_scale + 0.125)
                 case _:
                     self.on_key(event)
         else:
             self.on_key(event)
 
     def _mouse_event(self, event: spy.MouseEvent) -> None:
-        if not self.ui.handle_mouse_event(event):
+        pos = event.pos
+        self.mouse_pos = floor(pos.x), floor(pos.y)
+        if not imgui_backend.handle_mouse_event(event):
             self.on_mouse(event)
 
     def _shader_stamps(self) -> tuple[int | None, ...]:
@@ -151,8 +174,22 @@ class SlangToy:
                 stamps.append(None)
         return tuple(stamps)
 
-    def _reload_failed(self, error: Exception) -> None:
-        self._notify("Shader reload failed. See terminal.", error)
+    def _report_reload(self, error: Exception | None = None) -> None:
+        if error is None:
+            message = "Shader reloaded"
+            stream, color = sys.stdout, 32
+            self._notify(message)
+        else:
+            message = "Shader reload failed"
+            stream, color = sys.stderr, 31
+            self._notify(f"{message}. See terminal.")
+
+        headline = f"{message}: {self._watch[0].name}"
+        if stream.isatty() and not os.environ.get("NO_COLOR"):
+            headline = f"\x1b[{color}m{headline}\x1b[0m"
+        print(headline, file=stream, flush=True)
+        if error is not None:
+            print(error, file=stream, flush=True)
 
     def _notify(self, message: str, error: Exception | None = None) -> None:
         self._status = message
@@ -176,7 +213,7 @@ class SlangToy:
             )
             candidate = spy.Module(session.load_module(str(self._watch[0])))
         except (RuntimeError, ValueError) as error:
-            self._reload_failed(error)
+            self._report_reload(error)
             return None
         previous_module, self.module = self.module, candidate
         return previous_module
@@ -224,21 +261,62 @@ class SlangToy:
             except (OSError, RuntimeError) as error:
                 self._notify(f"Could not save {path.name}", error)
 
+    def _inspect_frame(self, target: spy.Texture) -> None:
+        self._inspect_requested = False
+        path = Path.cwd() / f"inspect-{datetime.now():%Y%m%d-%H%M%S-%f}.exr"
+        try:
+            target.to_bitmap().write(path, format=spy.Bitmap.FileFormat.exr)
+        except (OSError, RuntimeError) as error:
+            self._notify("Could not export inspection frame", error)
+            return
+
+        print(f"Inspection frame saved to {path}", flush=True)
+        executable = shutil.which("tev")
+        if executable is None and sys.platform == "darwin":
+            for applications in (Path("/Applications"), Path.home() / "Applications"):
+                candidate = applications / "tev.app/Contents/MacOS/tev"
+                if candidate.is_file():
+                    executable = str(candidate)
+                    break
+        if executable is None:
+            self._notify("tev unavailable. EXR saved")
+            return
+        try:
+            subprocess.Popen([executable, str(path)])
+        except OSError as error:
+            self._notify("Could not start tev. EXR saved", error)
+        else:
+            self._notify("Sent frame to tev")
+
     def run(self) -> None:
         """Open the window loop on the main thread and run until it closes."""
+        previous_context = imgui.get_current_context()
+        renderer = spy.ui.Context(self.device)
+        context = imgui.create_context()
+        imgui.set_current_context(context)
+        io = imgui.get_io()
+        io.set_ini_filename(None)
+        io.backend_flags |= (
+            imgui.BackendFlags_.renderer_has_textures | imgui.BackendFlags_.renderer_has_vtx_offset
+        )
+        io.fonts.add_font_default_vector()
+        imgui.get_style().font_size_base = 16.0
         self.window.on_resize = self._on_resize
         self.window.on_keyboard_event = self._keyboard_event
         self.window.on_mouse_event = self._mouse_event
         try:
             self._resize(self.window.width, self.window.height)
             self.setup()
-            self._run_frames()
+            self._run_frames(renderer)
         finally:
             self.window.on_resize = None
             self.window.on_keyboard_event = None
             self.window.on_mouse_event = None
             self.device.wait()
             self.surface.unconfigure()
+            imgui.destroy_context(context)
+            if previous_context is not None:
+                imgui.set_current_context(previous_context)
 
     def _metrics_text(self) -> str:
         gpu = "n/a" if self._query_pool is None else "…"
@@ -249,22 +327,57 @@ class SlangToy:
             text += "  ·  Paused"
         return text
 
-    def _run_frames(self) -> None:
-        target = None
-        panel = spy.ui.Window(
-            self.ui.screen, "Stats", position=spy.float2(10, 10), size=spy.float2(238, 43)
+    def _draw_overlay(self, now: float) -> None:
+        lines = [self._metrics_text()] if self.show_stats else []
+        if now < self._status_until:
+            lines.append(self._status)
+        if not lines:
+            return
+
+        style = imgui.get_style()
+        padding = style.window_padding
+        width = max(imgui.calc_text_size(line).x for line in lines)
+        line_height = imgui.get_text_line_height_with_spacing()
+        right = imgui.get_io().display_size.x - padding.x
+        left = max(padding.x, right - width - 2 * padding.x)
+        top = padding.y
+        bottom = top + 2 * padding.y + len(lines) * line_height - style.item_spacing.y
+        overlay = imgui.get_foreground_draw_list()
+        overlay.add_rect_filled(
+            (left, top), (right, bottom), imgui.get_color_u32((0.06, 0.07, 0.08, 0.82)),
+            rounding=padding.y,
         )
-        metrics = spy.ui.Text(panel)
-        notification = spy.ui.Text(panel)
-        notification.visible = False
+        overlay.push_clip_rect((left + padding.x, top), (right - padding.x, bottom), True)
+        for row, line in enumerate(lines):
+            overlay.add_text(
+                (left + padding.x, top + padding.y + row * line_height),
+                imgui.get_color_u32(imgui.Col_.text),
+                line,
+            )
+        overlay.pop_clip_rect()
+
+    def _run_frames(self, renderer: spy.ui.Context) -> None:
+        target = None
         index = 0
         elapsed = average_dt = 0.0
         previous = perf_counter()
+        ui_scale = None
+        renderer_size = None
+        style = imgui.get_style()
+        spacing = {
+            "window_padding": tuple(style.window_padding),
+            "frame_padding": tuple(style.frame_padding),
+            "item_spacing": tuple(style.item_spacing),
+            "item_inner_spacing": tuple(style.item_inner_spacing),
+        }
 
         while not self.window.should_close():
             self.window.process_events()
             if self.window.should_close():
                 break
+            if self._inspect_requested and target is not None:
+                self._inspect_frame(target)
+                previous = perf_counter()
             if self._pending_size is not None:
                 self._resize(*self._pending_size)
                 self._pending_size = None
@@ -282,70 +395,73 @@ class SlangToy:
 
             now = perf_counter()
             dt, previous = now - previous, now
-            previous_module = self._check_reload(now)
             average_dt = 0.9 * average_dt + 0.1 * dt if average_dt else dt
             self.fps = 1 / average_dt if average_dt > 0 else 0.0
-            if not self.paused:
-                elapsed += dt
+            if ui_scale != self._ui_scale:
+                style.font_scale_main = ui_scale = self._ui_scale
+                for name, (x, y) in spacing.items():
+                    setattr(style, name, (x * ui_scale, y * ui_scale))
+            # SlangPy's surface and native renderer use the window coordinate size.
+            imgui_backend.begin_frame(image.width, image.height, max(dt, 1e-6))
+            self.draw_ui()
+            self._draw_overlay(now)
+            imgui.render()
+            draw_data = imgui.get_draw_data()
+            imgui_backend.sync_draw_data_textures(self.device, renderer, draw_data)
+
+            encoder = self.device.create_command_encoder()
             size = image.width, image.height
-            if target is None or size != (target.width, target.height):
-                target = self.device.create_texture(
-                    width=size[0],
-                    height=size[1],
-                    format=spy.Format.rgba16_float,
-                    usage=spy.TextureUsage.shader_resource
-                    | spy.TextureUsage.unordered_access
-                    | spy.TextureUsage.render_target
-                    | spy.TextureUsage.copy_source
-                    | spy.TextureUsage.copy_destination,
-                    label="SlangToy frame",
-                )
-
-            pool = self._query_pool if len(self._timings) < _TIMING_SLOTS else None
+            pool = None
             timestamp = self._next_timestamp
-            if pool is not None:
-                pool.reset(timestamp, 2)
-
-            while True:
-                encoder = self.device.create_command_encoder()
+            previous_module = None
+            if target is None or not self.paused:
+                if target is None or size != (target.width, target.height):
+                    target = self.device.create_texture(
+                        width=size[0],
+                        height=size[1],
+                        format=spy.Format.rgba16_float,
+                        usage=spy.TextureUsage.shader_resource
+                        | spy.TextureUsage.unordered_access
+                        | spy.TextureUsage.render_target
+                        | spy.TextureUsage.copy_source
+                        | spy.TextureUsage.copy_destination,
+                        label="SlangToy frame",
+                    )
+                frame_dt = 0.0 if self.paused else dt
+                elapsed += frame_dt
+                previous_module = self._check_reload(now)
+                pool = self._query_pool if len(self._timings) < _TIMING_SLOTS else None
                 if pool is not None:
+                    pool.reset(timestamp, 2)
                     encoder.write_timestamp(pool, timestamp)
                 try:
-                    self.render(Frame(target, encoder, index, elapsed, dt))
+                    self.render(Frame(target, encoder, index, elapsed, frame_dt))
                 except (RuntimeError, ValueError, AttributeError) as error:
                     if previous_module is None:
                         raise
                     self.module, previous_module = previous_module, None
-                    self._reload_failed(error)
-                else:
-                    if previous_module is not None:
-                        self._notify("Shader reloaded")
-                    break
-
+                    self._report_reload(error)
+                    encoder = self.device.create_command_encoder()
+                    if pool is not None:
+                        encoder.write_timestamp(pool, timestamp)
+                    self.render(Frame(target, encoder, index, elapsed, frame_dt))
+                if pool is not None:
+                    encoder.write_timestamp(pool, timestamp + 1)
+                index += 1
             encoder.blit(image, target)
-            stats_visible = self.show_stats
-            panel.visible = stats_visible
-            if stats_visible:
-                metrics.text = self._metrics_text()
-                show_notification = now < self._status_until
-                if show_notification != notification.visible:
-                    panel.size = (
-                        spy.float2(320, 62) if show_notification else spy.float2(238, 43)
-                    )
-                    notification.visible = show_notification
-                notification.text = self._status
-            self.ui.begin_frame(*size, window=self.window)
-            if stats_visible and not panel.visible:
-                self.show_stats = False
-            self.ui.end_frame(image, encoder)
+            if size != renderer_size:
+                # SlangPy 0.43.1 reads the viewport dimensions from its native context.
+                renderer.begin_frame(*size)
+                renderer.end_frame(image, encoder)
+                renderer_size = size
+            imgui_backend.render_imgui_draw_data(renderer, draw_data, image, encoder)
 
-            if pool is not None:
-                encoder.write_timestamp(pool, timestamp + 1)
             submit_id = self.device.submit_command_buffer(encoder.finish())
             if pool is not None:
                 self._timings.append((timestamp, submit_id))
                 self._next_timestamp = (timestamp + 2) % (2 * _TIMING_SLOTS)
             del image
             self.surface.present()
+            if previous_module is not None:
+                self._report_reload()
             self._save_screenshots(target)
-            index += 1

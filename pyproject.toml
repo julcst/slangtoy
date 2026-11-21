@@ -5,11 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 authors = [{ name = "Julian Stamm", email = "mail@julcs.com" }]
 requires-python = ">=3.13"
-dependencies = ["numpy>=2.5.5", "slangpy>=0.43.1"]
+dependencies = [
+    "imgui-bundle>=1.93.0",
+    "numpy>=2.5.5",
+    "slangpy>=0.43.1",
+]
 
 [project.scripts]
-slangtoy = "slangtoy:main"
+sketch = "slangtoy.cli:main"
+slangtoy = "slangtoy.cli:square_world"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+# SlangPy owns the window and already links GLFW. Disable Hello ImGui's window
+# backend so ImGui Bundle does not load a second copy of GLFW on macOS.
+no-binary-package = ["imgui-bundle"]
+config-settings-package = { imgui-bundle = { "cmake.define.IMGUI_BUNDLE_WITH_HELLO_IMGUI" = "OFF" } }
